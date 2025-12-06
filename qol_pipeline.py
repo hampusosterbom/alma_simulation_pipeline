@@ -294,7 +294,7 @@ def makeMSFrame(
             f"readantenna({cfg_path!r}) returned {len(ant_res)} values; expected 4 or 8"
         )
 
-    # Observatory (COFA): prefer cfg, else ALMA; warn if telescope ≠ ALMA
+    # Observatory (COFA)
     if obspos is None:
         obspos = me.observatory('ALMA')
         if 'ALMA' not in str(tel).upper():
@@ -1713,5 +1713,6 @@ def trx_from_freq_ghz(freq_ghz: float, trx_override: float | None = None) -> flo
         )
 
     return val
+
 
 
