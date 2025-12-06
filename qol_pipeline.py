@@ -1672,38 +1672,46 @@ def _alma_band_from_freq_ghz(freq_ghz: float):
 
 def trx_from_freq_ghz(freq_ghz: float, trx_override: float | None = None) -> float:
     """
-    Return receiver temperature (K). If trx_override is not None, just use that.
-    Otherwise, look up T_rx,ASC (K) from the ALMA ASC table for the band. 
-    Values from Table 9.2 of the ASC docs (receiver temperatures). 
+    Return receiver temperature (K).
+
+    If trx_override is not None, that value is used directly.
+    Otherwise, we mimic CASA simobserve: T_rx is linearly interpolated
+    between tabulated values as a function of frequency.
+
+    ALMA receiver temperatures (K) and frequencies (GHz) from casadocs
+    (simobserve thermalnoise='tsys-atm'):
+
+        T_rx : 25, 30, 40, 42, 50, 50, 72, 135, 105, 230 K
+        ν    : 35, 75, 110, 145, 185, 230, 345, 409, 675, 867 GHz
     """
     if trx_override is not None:
-        return trx_override
+        return float(trx_override)
 
-    # Table: ALMA Band -> T_rx,ASC (K)
-    trx_table = {
-        1:  28.0,
-        3:  40.0,
-        4:  42.0,
-        5:  50.0,
-        6:  50.0,
-        7:  72.0,
-        8:  135.0,
-        9:  105.0,
-        10: 230.0,
-    }
+    # Frequencies (GHz) and corresponding T_rx (K) from CASA docs
+    freq_tab = np.array([35, 75, 110, 145, 185, 230, 345, 409, 675, 867], dtype=float)
+    trx_tab  = np.array([25, 30,  40,  42,  50,  50,  72, 135, 105, 230], dtype=float)
+
+    # Clamp outside the tabulated range
+    if freq_ghz <= freq_tab[0]:
+        val = float(trx_tab[0])
+    elif freq_ghz >= freq_tab[-1]:
+        val = float(trx_tab[-1])
+    else:
+        # Linear interpolation in frequency
+        val = float(np.interp(freq_ghz, freq_tab, trx_tab))
 
     band = _alma_band_from_freq_ghz(freq_ghz)
-    if band in trx_table:
-        val = trx_table[band]
+    if band is not None:
         logging.info(
-            f"[TRX] Using ASC T_rx={val:.1f} K for ALMA Band {band} "
-            f"(center_freq ≈ {freq_ghz:.1f} GHz)"
+            "[TRX] CASA-style interpolated T_rx=%.1f K at %.1f GHz (ALMA Band %d)",
+            val, freq_ghz, band
         )
-        return val
+    else:
+        logging.info(
+            "[TRX] CASA-style interpolated T_rx=%.1f K at %.1f GHz (outside nominal bands)",
+            val, freq_ghz
+        )
 
-    logging.warning(
-        f"[TRX] Could not map freq {freq_ghz:.1f} GHz to a known ALMA band; "
-        "falling back to 72 K."
-    )
-    return 72.0
+    return val
+
 
