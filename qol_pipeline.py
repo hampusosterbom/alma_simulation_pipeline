@@ -1,7 +1,7 @@
 """
 H. Österbom
 
-qol_simulation_pipeline.py
+qol_pipeline.py
 
 Low-level CASA and numerical utilities used throughout the simulation pipeline.
 
@@ -1706,3 +1706,4 @@ def trx_from_freq_ghz(freq_ghz: float, trx_override: float | None = None) -> flo
         "falling back to 72 K."
     )
     return 72.0
+
