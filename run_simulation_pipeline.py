@@ -18,8 +18,15 @@ Responsibilities:
   * Run imaging (dirty + cleaned) and optional baseline-group imaging
   * Validate image-plane noise vs theoretical σ_vis/√N
   * Write structured logs and FITS outputs
-ps: Only tested on CASA 6.7!!!
+ps: Only tested on CASA 6.7!!! also, if the program cant fint your custom cfgs, try placing them where all other ALMA cfgs live. 
 This is the main orchestrator tying together all QoL, PB/VP, and validation tools.
+
+To run the program:
+(i) Make sure the following files (and any others the pipeline imports) are in the same directory.
+(ii) Set the CASA binary path, e.g., casa_bin = "/path/to/your/casa/bin/casa"
+(iii) Adjust parameters in EXAMPLE_SETTINGS.
+(iv) cd into the folder and run the pipeline using CASA in non-GUI mode: 
+    casa --nogui --nologger -c run_simulation_pipeline.py
 """
 
 import os
@@ -48,18 +55,16 @@ mysu = simutil.simutil()
 myms = ms()
 vp = vpmanager()
 
-
-sys.path[:0] = [str(Path(__file__).resolve().parent), str(Path.home()), str(Path.cwd())]
+# search for imports 
+sys.path[:0] = [str(Path(__file__).resolve().parent)]
 from qol_pipeline import (
     makeMSFrame,                                        # builds empty MS with your cfg/pointings/spw/times
     predictImager,                                      # (optional, we won't rely on it for prediction)
     addNoiseSim,                                        # CASA tsys-atm (with per D efficiency scaling)
     build_baseline_group_selectors_by_diameter,         # Helper to build baseline groups by diameter
-    estimate_sefd_by_diameter,                          # estimate SEFD(D) from σ_vis on same-diameter baselines
     make_startmodel_match,                              # regrid / resize sky model to match MS imaging geometry    
     read_restoring_beam,                                # read beam major/minor/PA from .image/.psf
     find_config_path,                                   # resolve ALMA .cfg path from name or alias
-    debug_ms_summary,                                   # quick summary: nants, spws, vis ranges, diameters
     build_ha_scans,                                     # create hour-angle scan blocks for custom simulations
     make_center_box_mask_crtf,                          # build a CRTF mask string for CLEAN (central box)
     measure_image_stats,                                # peak + RMS + beam measurement with PB/centering options
@@ -83,6 +88,8 @@ from pb_vp import(
 from validation import(
     run_noise_validation_single_field,                  # image-plane noise validation on noise-only MS
     hetero_checkVals,                                   # vis-domain hetero checks: A/A, B/B, A/B noise + stats
+    estimate_sefd_by_diameter,                          # estimate SEFD(D) from σ_vis on same-diameter baselines
+    debug_ms_summary,                                   # quick summary: nants, spws, vis ranges, diameters
 
 )
 
@@ -101,9 +108,9 @@ EXAMPLE_SETTINGS = dict(
     extra_dirs=[],                                # Extra dirs to search for cfg files
 
     # --- Array configuration(s) ---
-    config_map={"alma.C43p6x50.cfg": "GG"},           # {cfg_file : short_tag}      
+    config_map={"alma.demo3.cfg": "GG"},           # {cfg_file : short_tag}      
     declinations=["-23d00m00.00"],                # Target declination(s)
-    integration_times=["0.1h"],                     # On-source time(s)
+    integration_times=["1h"],                     # On-source time(s)
 
     # --- Frequency setup ---
     center_freq="343.5GHz",                       # Reference frequency
@@ -185,7 +192,7 @@ EXAMPLE_SETTINGS = dict(
     # Antenna/aperture efficiencies for tsys-atm noise model // Eff. for 7-and 12m at various freqs can be found in 
     # the ALMA technical handbook page 147 (cycle 12 handbook)
     eta_A=0.63,                                   # Efficiency for large dishes (e.g. 12m)
-    eta_B=0.66,                                   # Efficiency for small dishes (e.g. 7m)
+    eta_B=0.63,                                   # Efficiency for small dishes (e.g. 7m)
     spillefficiency=0.96,                         # Spillover efficiency
     trx_K=None,                                   # Receiver temperature (K) ; None => auto from ALMA band & center_freq
     correfficiency=0.88,                          # Correlator efficiency
@@ -1155,4 +1162,5 @@ def example_run():
 if __name__ == "__main__":
     # Simple “script mode”: just use EXAMPLE_SETTINGS above.
     example_run()
+
 

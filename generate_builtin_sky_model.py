@@ -20,9 +20,13 @@ from casatools import quanta, componentlist, image
 from casatasks import exportfits
 
 
+
 # ---------- Shared helpers ----------
 
 def setup_logging(log_file=None):
+    """
+    Configure basic logging to stdout, and optionally to a log file.
+    """
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(levelname)s - %(message)s"
@@ -48,6 +52,10 @@ def extract_number(s):
 
 
 def validate_ra_dec(value, type_str):
+    """
+    Check that an RA/Dec string can be converted to radians by casatools.quanta.
+    This is a basic format validation step.
+    """
     logging.debug(f"Validating {type_str}: {value}")
     try:
         qa = quanta()
@@ -62,6 +70,9 @@ def validate_ra_dec(value, type_str):
 
 
 def make_imagename(output_base, dec_center):
+    """
+    Build a unique imagename by encoding the declination into the filename.
+    """
     tag = dec_center.replace("-", "m").replace("+", "p").replace("d", "").replace(".", "")
     return f"{output_base}_dec{tag}"
 
@@ -70,7 +81,7 @@ def make_imagename(output_base, dec_center):
 
 def make_ring_model(args):
     """
-    8+1 Gaussian ring model (based on generate_sky_model.py).
+    8+1 Gaussian ring model.
     """
     qa_tool = quanta()
     comp_list = componentlist()
@@ -80,10 +91,11 @@ def make_ring_model(args):
     flux = args.ring_flux
     sflux = flux / 100.0  # ring sources are 1/100 of central
 
+    # Parse beam FWHM values from strings like "0.022arcsec"
     major_beam_arcsec = extract_number(args.ring_major_beam)
     minor_beam_arcsec = extract_number(args.ring_minor_beam)
 
-    # Central Gaussian
+    # --- Central Gaussian at phase center ---
     comp_list.addcomponent(
         dir=f"J2000 {args.ra_center} {args.dec_center}",
         flux=flux,
@@ -95,14 +107,17 @@ def make_ring_model(args):
         positionangle=args.ring_pa_beam,
     )
 
-    # Ring Gaussians
+    # --- Ring Gaussians placed around the center at fixed radius ---
     dec_rad = qa_tool.convert(args.dec_center, "rad")
     cos_dec = cos(dec_rad["value"])
     for i in range(args.ring_n):
+        # angle of this ring component
         ang = 2 * pi * i / args.ring_n
+        # small angular offsets in arcsec (correcting RA by cos(dec))
         dx_arcsec = args.ring_radius * cos(ang) / cos_dec
         dy_arcsec = args.ring_radius * sin(ang)
 
+        # convert offsets to RA/Dec in radians and add to center
         ra_rad = qa_tool.convert(args.ra_center, "rad")
         dec_rad = qa_tool.convert(args.dec_center, "rad")
         dx_rad = qa_tool.convert(f"{dx_arcsec}arcsec", "rad")
@@ -122,7 +137,7 @@ def make_ring_model(args):
             minoraxis=args.ring_minor_beam,
             positionangle=args.ring_pa_beam,
         )
-
+    # --- Create empty CASA image with correct shape/coords ---
     imagename = make_imagename(args.output_base, args.dec_center)
     im_shape = list(args.im_shape) + [1, 1]
 
@@ -144,6 +159,7 @@ def make_ring_model(args):
     img_tool.setcoordsys(cs.torecord())
     img_tool.setbrightnessunit("Jy/pixel")
 
+    # --- Put components into the image and export to FITS ---
     img_tool.modify(comp_list.torecord(), subtract=False)
     img_tool.done()
 
@@ -155,6 +171,9 @@ def make_ring_model(args):
 # ---------- Point + disk model ----------
 
 def add_disk(cl, center_dir, diameter_arcsec, total_flux_jy, freq):
+    """
+    Add a uniform disk component of given diameter and total flux to a component list.
+    """
     d = f"{diameter_arcsec}arcsec"
     cl.addcomponent(
         dir=center_dir,
@@ -169,6 +188,9 @@ def add_disk(cl, center_dir, diameter_arcsec, total_flux_jy, freq):
 
 
 def add_point(cl, center_dir, flux_jy, freq):
+    """
+    Add a point source component at the given direction.
+    """
     cl.addcomponent(
         dir=center_dir,
         flux=flux_jy,
@@ -180,13 +202,15 @@ def add_point(cl, center_dir, flux_jy, freq):
 
 def make_pointdisk_model(args):
     """
-    Point + disk model (based on generate_point_plus_disk_sky_model.py).
+    Point + disk model.
+    Bright point source at phase center plus a fainter, small disk.
     """
     qa = quanta()
     cl = componentlist()
     ia_tool = image()
     cl.done()
 
+    # Center direction in J2000 RA/Dec string form
     ra_rad = qa.convert(args.ra_center, "rad")
     dec_rad = qa.convert(args.dec_center, "rad")
     center_dir = f"J2000 {qa.tos(ra_rad)} {qa.tos(dec_rad)}"
@@ -203,6 +227,7 @@ def make_pointdisk_model(args):
         f"Disk: diameter={args.pnd_disk_diameter:.4f}\" flux={disk_flux:.3e} Jy."
     )
 
+    # --- Create empty CASA image and set basic coordinate system ---
     imagename = make_imagename(args.output_base, args.dec_center)
     shape = list(args.im_shape) + [1, 1]
     ia_tool.fromshape(f"{imagename}.im", shape, overwrite=True)
@@ -218,6 +243,7 @@ def make_pointdisk_model(args):
     ia_tool.setcoordsys(cs.torecord())
     ia_tool.setbrightnessunit("Jy/pixel")
 
+    # --- Put components into image and export to FITS ---
     ia_tool.modify(cl.torecord(), subtract=False)
     ia_tool.done()
 
@@ -304,3 +330,5 @@ if __name__ == "__main__":
     args_list = sys.argv[1:]
     args = parse_args_from_cli(args_list)
     main(args)
+
+

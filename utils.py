@@ -92,3 +92,4 @@ def make_short_tag(sky, cfg_short, itime, dec, wt, rb, tap):
     tap_t = 't' + tap.replace('arcsec', '').replace('.', 'p')
     return '_'.join([sky_t, cfg_short, it_t, dec_t, wm + rb_t, tap_t])
 
+

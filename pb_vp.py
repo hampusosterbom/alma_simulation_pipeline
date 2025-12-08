@@ -1,4 +1,3 @@
-
 """
 H. Österbom
 
@@ -73,7 +72,7 @@ def _makePBImage(
 
     safe_rm_tree(outfile)
 
-
+    # Create an empty 4D CASA image
     stokes_n = 4
     chans = 1
 
@@ -112,8 +111,9 @@ def _makePBImage(
 
     lam = C / (freq_ghz * 1e9)
 
-    # --- Choose PB model: define POWER PB first ---
+    # --- Choose PB model: define POWER PB first (intensity response), then convert to voltage PB. ---
     if pb_model == "airy":
+        # Uses the uniform circular aperture Airy pattern
         from scipy.special import j1 as bessel_j1  
         # Uniform circular aperture → Airy *power* pattern
         x = math.pi * dish_m * r_rad / lam
@@ -123,31 +123,34 @@ def _makePBImage(
         fwhm_arcsec = np.nan  # hard to define analytically; we can measure from pb_power
     else:
         if pb_model == "alma":
+            # Uses an empirical ALMA FWHM formula (From technical handbook)
             fwhm_arcsec = _pb_fwhm_arcsec_alma(freq_ghz, dish_m, k_hpbw=1.13)
         elif pb_model == "gauss":
+            # The "gauss" option lets you experiment with arbitrary FWHMs.
             if gauss_fwhm_arcsec is None:
                 raise ValueError("pb_model='gauss' requires gauss_fwhm_arcsec")
             fwhm_arcsec = float(gauss_fwhm_arcsec)
         else:
             raise ValueError(f"Unknown pb_model='{pb_model}'")
-
+        # Converts FWHM to Gaussian width in radians and evaluates as a function of angular radius on the sky
         sigma_rad = (fwhm_arcsec / ARCSEC_PER_RAD) / math.sqrt(8.0 * math.log(2.0))
         pb_power = np.exp(-0.5 * (r_rad / sigma_rad) ** 2)
 
-    # Normalise POWER PB
+    # Clips the primary-beam power values to stay within [0, 1], and
+    # normalizes the PB such that its peak value is exactly 1.
     pb_power = np.clip(pb_power, 0.0, 1.0)
     if pb_power.max() > 0:
         pb_power /= pb_power.max()
 
-    # Voltage pattern for VP table
+    # Convert power pattern to voltage pattern
     pb = np.sqrt(pb_power)
 
-    # Guard ring at edges
-    guard = 8
-    pb[:guard, :] = 0
-    pb[-guard:, :] = 0
-    pb[:, :guard] = 0
-    pb[:, -guard:] = 0
+    # Guard ring at edges (Do not use when FoV<<PB!!!)
+    #guard = 8
+    #pb[:guard, :] = 0
+    #pb[-guard:, :] = 0
+    #pb[:, :guard] = 0
+    #pb[:, -guard:] = 0
 
     # XX and YY get PB (voltage), XY/YX = 0
     pix[:, :, 0, 0] = pb  # XX
@@ -309,3 +312,4 @@ def inspect_vptable(vptab):
         tb.close()
 
     print("=== END VP TABLE CONTENTS ===\n")
+

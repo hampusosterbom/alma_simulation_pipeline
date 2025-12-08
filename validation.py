@@ -20,14 +20,13 @@ import math
 import shutil
 import logging
 import numpy as np
+from collections import Counter, defaultdict
 from casatools import table
-from casatasks import tclean
+from casatasks import tclean, mstransform
 from utils import safe_rm_tree
 from utils import wipe
 from qol_pipeline import (
     build_baseline_group_selectors_by_diameter,
-    build_group_ms,
-    _amp_stats_ms,
     measure_image_stats,
     _read_antenna_table,
 )
@@ -67,6 +66,103 @@ def load_sigma_vis_and_N(msname):
 
     return sigma_vis, N
 
+
+
+def _amp_stats_ms(ms_path):
+    """
+    Compute basic amplitude and weight statistics for an MS.
+
+    Uses unflagged DATA values to compute mean and standard deviation of
+    |DATA|, along with the number of samples. Also computes the mean
+    weight from WEIGHT_SPECTRUM if present, otherwise from WEIGHT (broadcast
+    over channels), or defaults to 1 if neither is available.
+
+    Returns a dict with keys: mean_amp, std_amp, npts, meanwt.
+    """
+    tb.open(ms_path)
+    try:
+        data = tb.getcol("DATA")          # (pol, chan, row)
+        colnames = set(tb.colnames())
+        flag = tb.getcol("FLAG") if "FLAG" in colnames else None
+
+        if "WEIGHT_SPECTRUM" in colnames:
+            ws = tb.getcol("WEIGHT_SPECTRUM")  # (pol, chan, row)
+            W = None
+        else:
+            ws = None
+            W = tb.getcol("WEIGHT") if "WEIGHT" in colnames else None
+    finally:
+        tb.close()
+
+    if flag is not None:
+        good = ~flag
+        vals = data[good]
+    else:
+        vals = data.ravel()
+
+    if vals.size == 0:
+        return dict(mean_amp=float("nan"),
+                    std_amp=float("nan"),
+                    npts=0,
+                    meanwt=float("nan"))
+
+    amp = np.abs(vals)
+    mean_amp = float(np.mean(amp))
+    std_amp = float(np.std(amp))
+    npts = int(amp.size)
+
+    if ws is not None:
+        w_vals = ws[good] if flag is not None else ws.ravel()
+    elif W is not None:
+        # W shape: (pol, row) -> broadcast over channels
+        npol, nrow = W.shape
+        nchan = data.shape[1]
+        W_b = np.repeat(W, nchan, axis=1).reshape(npol, nchan, nrow)
+        w_vals = W_b[good] if flag is not None else W_b.ravel()
+    else:
+        w_vals = np.ones_like(amp)
+
+    meanwt = float(np.mean(w_vals)) if w_vals.size > 0 else float("nan")
+    return dict(mean_amp=mean_amp, std_amp=std_amp, npts=npts, meanwt=meanwt)
+
+
+def build_group_ms(vis, antsels, suffix):
+    """
+    Split a full MS into separate A–A, B–B, and A–B (cross) baseline
+    sub-MSs using mstransform. Each antsels[key] is an antenna-selection
+    string that selects the baselines belonging to that heterogeneity
+    group. This enables per-group noise analysis, SEFD checks, and
+    imaging diagnostics for heterogeneous arrays.
+
+    Returns a dict {group: ms_path}.
+    """
+    group_ms = {}
+    for key in ("A", "B", "cross"):
+        antsel = antsels.get(key)
+        if not antsel:
+            continue
+
+        outvis = vis.rstrip("/") + f"_{suffix}_{key}.ms"
+        if os.path.exists(outvis):
+            logging.info("[group_ms] Removing existing %s", outvis)
+            shutil.rmtree(outvis)
+
+        logging.info(
+            "[group_ms] mstransform → %s (group=%s, antenna='%s')",
+            outvis, key, antsel,
+        )
+        mstransform(
+            vis=vis,
+            outputvis=outvis,
+            antenna=antsel,
+            datacolumn="data",
+            keepflags=True,
+            regridms=False,
+            chanaverage=False,
+            timeaverage=False,
+        )
+        group_ms[key] = outvis
+    return group_ms
 
 
 def is_ms_heterogeneous(vis: str) -> bool:
@@ -150,12 +246,11 @@ def hetero_checkVals(
 
     logging.info("[hetero_checkVals] Starting for vis=%s", vis)
 
-    # --- Dish diameters → define A/B labels ---
-    tb.open(vis + "/ANTENNA")
-    try:
-        diams = tb.getcol("DISH_DIAMETER").astype(float)
-    finally:
-        tb.close()
+    # ------------------------------------------------------------------
+    # 1) Read dish diameters and define A/B dish classes
+    #    A = largest diameter, B = second-largest (if present).
+    # ------------------------------------------------------------------
+    diams, names = _read_antenna_table(vis)
 
     uniq_d = sorted({round(float(d), 3) for d in diams if d == d}, reverse=True)
     if not uniq_d:
@@ -168,7 +263,7 @@ def hetero_checkVals(
     label_B = f"{D_B:.0f}m" if D_B is not None else ""
 
 
-    # --- Reference frequency, for PB-size printout ---
+    # --- 2) Reference frequency, for PB-size printout ---
     tb.open(vis + "/SPECTRAL_WINDOW")
     try:
         nu_hz = float(tb.getcell("REF_FREQUENCY", 0))
@@ -177,7 +272,10 @@ def hetero_checkVals(
     freq_ghz = nu_hz / 1e9
 
 
-    # --- Build A/B/cross antenna selectors + sub-MSs ---
+    # ------------------------------------------------------------------
+    # 3) Split MS into A, B, and cross baseline groups (sub-MSs).
+    #    If this fails, we still continue with only the full MS stats.
+    # ------------------------------------------------------------------
     try:
         antsels = build_baseline_group_selectors_by_diameter(vis)
         group_ms = build_group_ms(vis, antsels, suffix="hetero")
@@ -185,7 +283,8 @@ def hetero_checkVals(
         logging.warning("[hetero_checkVals] Could not build baseline group MSs: %s", e)
         group_ms = {}
 
-    # --- Per-group amplitude + noise stats ---
+    # --- 4) For each group MS (A, B, cross), measure 
+    # amplitude stats + noise stats ---
     amp_stats = {}
     noise_stats = {}
 
@@ -194,7 +293,8 @@ def hetero_checkVals(
         sigma_vis, N, sigma_im = vis_to_image_noise(ms_path)
         noise_stats[key] = dict(sigma_vis=sigma_vis, N=int(N), sigma_im_calc=sigma_im)
 
-    # "all" stats directly from full MS
+    # 5) For the full MS ("all"), measure the same visibility noise and
+    #    compute a naive σ_im directly from the combined MS.
     amp_stats["all"] = _amp_stats_ms(vis)
     sigma_vis_all, N_all, sigma_im_all_naive = vis_to_image_noise(vis)
     noise_stats["all_naive"] = dict(
@@ -203,7 +303,7 @@ def hetero_checkVals(
         sigma_im_calc=sigma_im_all_naive,
     )
 
-    # --- Heterogeneous ALL theory from A/B/cross ---
+    # --- 6) Heterogeneous ALL theory from A/B/cross ---
     denom = 0.0
     for key in ("A", "B", "cross"):
         s = noise_stats.get(key)
@@ -224,11 +324,12 @@ def hetero_checkVals(
         sigma_im_naive=sigma_im_all_naive,
     )
 
-    # --- Theoretical VisStd(calc) and Weight(calc) ratios ---
+    # --- 7) Theoretical ratios for VisStd and weight between A/B/cross ---
     D_A2 = D_A**2
     D_B2 = D_B**2 if D_B is not None else None
 
     def _visstd_calc(tag):
+        # Noise scaling relative to A–A.
         if tag == "A":
             return 1.0
         if tag == "B" and D_B2 is not None:
@@ -238,15 +339,16 @@ def hetero_checkVals(
         return float("nan")
 
     def _w_calc(tag):
+        # Expected relative weights 
         if tag == "A":
             return 1.0
         if tag == "B" and D_B2 is not None:
-            return (D_B2 / D_A2)**2      # weight ∝ 1/σ^2
+            return (D_B2 / D_A2)**2      
         if tag == "cross" and D_B2 is not None:
-            return ((D_A * D_B) / D_A2)**2
+            return ((D_A * D_B) / D_A2)**2       # geometric mean
         return float("nan")
 
-    # --- Theoretical peaks from VisMean (still computed but no longer printed) ---
+    # --- 8) Theoretical peaks from VisMean (still computed but no longer printed) ---
     peak_calc = {}
     if amp_stats.get("A", {}).get("npts", 0) > 0:
         peak_calc["A"] = amp_stats["A"]["mean_amp"]
@@ -256,7 +358,7 @@ def hetero_checkVals(
         peak_calc["cross"] = math.sqrt(peak_calc["A"] * peak_calc["B"])
     peak_calc["all"] = float("nan")  # keep as NaN for completeness
 
-    # --- Pretty-printed table (simplified) ---
+    # --- 9) Pretty-printed summary table  ---
     hdr = (
         "Baseline", "VisMean", "VisStd(sim)", "VisStd(calc)",
         "#DataPts", "Weight(calc)", "Weight(sim)",
@@ -274,6 +376,12 @@ def hetero_checkVals(
     }
 
     def _fmt_row(baseline_label, tag):
+        """
+        Format one summary-table row for a given baseline group (A, B, cross, all).
+        Returns a tuple of values to be printed, or None if stats are missing.
+        """
+
+        # Special case: "all" row only compares image RMS (calc vs. meas).
         if tag == "all":
             ns = noise_stats["all"]
             rms_calc_mJy = ns["sigma_im_calc"] * 1e3
@@ -284,24 +392,29 @@ def hetero_checkVals(
                 float("nan"), float("nan"), float("nan"),
                 rms_calc_mJy, rms_meas_mJy,
             )
-
+        
+        # --- For real groups (A, B, cross): fetch amplitude and noise stats.
         a = amp_stats.get(tag, {})
         ns = noise_stats.get(tag, {})
         if not a or not ns:
             return None
 
-        vismean     = a["mean_amp"]
-        visstd_sim  = a["std_amp"]
-        npts        = float(a["npts"])
-        w_sim       = a["meanwt"]
+        # Visibility-domain statistics
+        vismean     = a["mean_amp"]     # mean |DATA|
+        visstd_sim  = a["std_amp"]      # simulated visibility RMS
+        npts        = float(a["npts"])  # number of vis samples
+        w_sim       = a["meanwt"]       # mean weight
 
-        visstd_th   = _visstd_calc(tag)
-        w_calc      = _w_calc(tag)
+        # Theoretical expectations (based on dish sizes)
+        visstd_th   = _visstd_calc(tag)     # predicted vis RMS ratio
+        w_calc      = _w_calc(tag)          # predicted weight ratio
 
+        # Image-domain noise: calculated vs measured
         sigma_im    = ns["sigma_im_calc"]
         rms_calc_mJy = sigma_im * 1e3
         rms_meas_mJy = meas_rms.get(tag, float("nan")) * 1e3
 
+        # Return the row contents (order matches the printed table columns)
         return (
             baseline_label,
             vismean, visstd_sim, visstd_th,
@@ -309,6 +422,8 @@ def hetero_checkVals(
             rms_calc_mJy, rms_meas_mJy,
         )
 
+    # Print one table row per baseline group.
+    # Skip missing groups; format numbers nicely aligned; show NaN placeholders.
     for tag, label in baseline_labels.items():
             if not label:
                 continue
@@ -319,7 +434,9 @@ def hetero_checkVals(
                 f"{x:>14.4f}" if isinstance(x, (int, float)) and x == x else f"{x:>14}"
                 for x in row
             ))
-
+    # ------------------------------------------------------------------
+    # 10) Print primary beam FWHM for each dish type (for context).
+    # ------------------------------------------------------------------
     print(
         "\nCalculated PB size for type A (dia={0:2.2f} m): {1:3.5f} arcmin"
         .format(D_A, calc_ang(freq_ghz, D_A))
@@ -330,7 +447,9 @@ def hetero_checkVals(
             .format(D_B, calc_ang(freq_ghz, D_B))
         )
 
-    # --- Cleanup temporary group MSs ---
+    # ------------------------------------------------------------------
+    # 11) Clean up temporary A/B/cross sub-MSs unless asked to keep them.
+    # ------------------------------------------------------------------
     if not keep_group_ms:
         for key, ms_path in group_ms.items():
             try:
@@ -640,4 +759,388 @@ def run_noise_validation_single_field(
         logging.error("[noiseval] Failed to write JSON summary: %s", e)
 
     return out
+
+
+
+def _corr_type_names(corr_type_ids):
+    # https://casacore.github.io/casacore/Stokes_8h_source.html
+    m = {
+        1: "I",   2: "Q",   3: "U",   4: "V",
+        5: "RR",  6: "RL",  7: "LR",  8: "LL",
+        9: "XX", 10: "XY", 11: "YX", 12: "YY",
+    }
+    return [m.get(int(x), str(int(x))) for x in corr_type_ids]
+
+
+def estimate_sefd_by_diameter(msname):
+    """
+    Estimate effective SEFD (Jy) per dish diameter directly from a noisy MS.
+
+    Uses:
+      * per-baseline-type RMS from checkvals()
+      * radiometer eq: σ_ij = sqrt(SEFD_i * SEFD_j) / sqrt(2 Δν t)
+
+    For homogeneous baselines D–D:
+      SEFD(D) = σ_DD * sqrt(2 Δν t)
+
+    Returns
+    -------
+    dict
+        {diameter_m: sefd_Jy}
+    """
+
+    baseline_stats = checkvals(msname, datacol='DATA')  # already prints summary
+
+    # Group RMS by (D1, D2) (smallest first)
+    group_rms = defaultdict(lambda: {'sum_sig2': 0.0, 'n': 0})
+
+    for bl in baseline_stats:
+        d1 = float(bl['D1_m'])
+        d2 = float(bl['D2_m'])
+        n  = int(bl['npts'])
+        if n <= 0:
+            continue
+
+        sig_re = float(bl['rms_re_Jy'])
+        sig_im = float(bl['rms_im_Jy'])
+        if not (np.isfinite(sig_re) and np.isfinite(sig_im)):
+            continue
+
+        # sigma_vis from Re/Im
+        sigma_ri = math.sqrt(0.5 * (sig_re**2 + sig_im**2))
+
+        if d2 < d1:
+            d1, d2 = d2, d1
+        key = (round(d1, 3), round(d2, 3))
+
+        group_rms[key]['sum_sig2'] += (sigma_ri ** 2) * n
+        group_rms[key]['n']        += n
+
+    # Delta ν from SPW0; t_int from MAIN
+    tb.open(msname + "/SPECTRAL_WINDOW")
+    try:
+        chan_width = float(tb.getcell("CHAN_WIDTH", 0))  # Hz
+        dnu = abs(chan_width)
+    finally:
+        tb.close()
+
+    tb.open(msname)
+    try:
+        t_int = float(tb.getcell("INTERVAL", 0))  # s
+    finally:
+        tb.close()
+
+    if not (dnu > 0 and t_int > 0):
+        print(f"[SEFD] Invalid dnu={dnu}, t_int={t_int}; cannot estimate SEFD.")
+        return {}
+
+    sefd_map = {}
+    eta_s = 0.88
+
+    for (d1, d2), acc in group_rms.items():
+        if d1 != d2:
+            continue
+        n = acc['n']
+        if n <= 0:
+            continue
+        sigma_dd = math.sqrt(acc['sum_sig2'] / n)  # Jy
+        sefd = sigma_dd * eta_s * math.sqrt(2.0 * dnu * t_int)  # Jy
+        sefd_map[d1] = sefd
+
+    if not sefd_map:
+        print("[SEFD] No homogeneous baseline groups found; cannot estimate SEFDs.")
+        return {}
+
+    print("\n[SEFD] Effective SEFD per dish diameter (from noise in MS):")
+    print("  Dia (m) |  SEFD (Jy)")
+    print("  --------------------")
+    for d in sorted(sefd_map.keys()):
+        print(f"  {d:7.3f} | {sefd_map[d]:9.1f}")
+
+    # Optional check for cross baselines
+    if len(sefd_map) >= 2:
+        diams = sorted(sefd_map.keys())
+        dA, dB = diams[0], diams[1]
+        sefd_A = sefd_map[dA]
+        sefd_B = sefd_map[dB]
+        sigma_AB_theory = (1/eta_s) * math.sqrt(sefd_A * sefd_B) / math.sqrt(2.0 * dnu * t_int)
+
+        key_AB = (round(min(dA, dB), 3), round(max(dA, dB), 3))
+        if key_AB in group_rms:
+            acc_AB = group_rms[key_AB]
+            n_AB = acc_AB['n']
+            if n_AB > 0:
+                sigma_AB_meas = math.sqrt(acc_AB['sum_sig2'] / n_AB)
+                print("\n[SEFD] Cross-baseline check:")
+                print(f"  σ_AB(meas)   = {sigma_AB_meas:.4e} Jy")
+                print(f"  σ_AB(theory) = {sigma_AB_theory:.4e} Jy (sqrt(SEFD_A SEFD_B))")
+
+    return sefd_map
+
+
+
+
+def checkvals(vis, datacol='DATA', combine_conj=True, max_baselines=None):
+    """
+    Measure per-baseline visibility RMS from an MS.
+
+    For each (ANTENNA1, ANTENNA2) pair, accumulate the unflagged samples
+    from the given data column and compute RMS of the real part, imaginary
+    part, and complex amplitude. Conjugate baselines (i,j) and (j,i) can
+    optionally be combined.
+
+    The function prints a baseline-type noise summary grouped by dish-size
+    pairs (e.g. '7m-7m', '7m-12m', '12m-12m'), and returns a list of per-
+    baseline statistics dictionaries.
+    // This is more of a debugger tool, we mainly use "hetero_checkVals()" = for structured heterogeneity check (pipeline)
+    """
+
+    tb.open(vis)
+    try:
+        cols = set(tb.colnames())
+        if datacol not in cols:
+            raise RuntimeError(f"{vis}: column {datacol!r} not found in MS.")
+        ant1 = tb.getcol('ANTENNA1')
+        ant2 = tb.getcol('ANTENNA2')
+        data = tb.getcol(datacol)           # (npol, nchan, nrow)
+        flag = tb.getcol('FLAG') if 'FLAG' in cols else None
+    finally:
+        tb.close()
+
+    # Antenna diameters
+    diams, names = _read_antenna_table(vis)
+
+    npol, nchan, nrow = data.shape
+    accum = {}  # (i,j) -> [sum_re2, sum_im2, sum_abs2, n]
+
+    for r in range(nrow):
+        i = int(ant1[r])
+        j = int(ant2[r])
+
+        if combine_conj and j < i:
+            i, j = j, i
+
+        key = (i, j)
+        if key not in accum:
+            accum[key] = [0.0, 0.0, 0.0, 0]
+
+        slice_ij = data[:, :, r]   # (npol, nchan)
+        if flag is not None:
+            m = ~flag[:, :, r]
+            vals = slice_ij[m]
+        else:
+            vals = slice_ij.ravel()
+
+        if vals.size == 0:
+            continue
+
+        re = vals.real
+        im = vals.imag
+        abs2 = re**2 + im**2
+
+        accum[key][0] += float((re**2).sum())
+        accum[key][1] += float((im**2).sum())
+        accum[key][2] += float(abs2.sum())
+        accum[key][3] += int(vals.size)
+
+    baseline_stats = []
+    for (i, j), (sre2, sim2, sabs2, n) in sorted(accum.items()):
+        if n == 0:
+            continue
+        rms_re  = math.sqrt(sre2 / n)
+        rms_im  = math.sqrt(sim2 / n)
+        rms_abs = math.sqrt(sabs2 / n)
+        D1 = float(diams[i]) if i < len(diams) else float('nan')
+        D2 = float(diams[j]) if j < len(diams) else float('nan')
+        bl = {
+            'ant1': i,
+            'ant2': j,
+            'name1': names[i] if i < len(names) else f'A{i}',
+            'name2': names[j] if j < len(names) else f'A{j}',
+            'D1_m': D1,
+            'D2_m': D2,
+            'blkey': f"{i:02d}-{j:02d}",
+            'npts': n,
+            'rms_re_Jy': rms_re,
+            'rms_im_Jy': rms_im,
+            'rms_abs_Jy': rms_abs,
+        }
+        baseline_stats.append(bl)
+
+    #print("Calculated PB size for type A (dia=%2.2f) : %3.5f arcmin"%(D_A, calc_ang(freq,D_A)))
+    #print("Calculated PB size for type B (dia=%2.2f) : %3.5f arcmin"%(D_B, calc_ang(freq,D_B)))
+    _print_baseline_type_summary(baseline_stats)
+    return baseline_stats
+
+def _print_baseline_type_summary(baseline_stats):
+    """
+    Summarize per-baseline RMS into baseline-type groups like '12m-12m', '12m-18m', etc.
+
+    baseline_stats : list of dict
+        Output from checkvals(), each with keys:
+        'D1_m', 'D2_m', 'npts', 'rms_abs_Jy', ...
+    """
+
+    # Group by *dish size pairs*, smallest diameter first, e.g. 12-12, 12-18, 18-18
+    groups = defaultdict(lambda: {'sum_abs2': 0.0, 'npts': 0, 'nbl': 0})
+
+    for bl in baseline_stats:
+        d1 = float(bl['D1_m'])
+        d2 = float(bl['D2_m'])
+        n  = int(bl['npts'])
+        sig = float(bl['rms_abs_Jy'])
+
+        # Skip weird entries
+        if not (n > 0 and sig == sig):
+            continue
+
+        # (12,18) and (18,12) -> '12m-18m'
+        if d2 < d1:
+            d1, d2 = d2, d1
+        label = f"{d1:.0f}m-{d2:.0f}m"
+
+        g = groups[label]
+        g['sum_abs2'] += (sig**2) * n   # accumulate variance × N
+        g['npts']     += n
+        g['nbl']      += 1
+
+    # Also accumulate "All"
+    total = {'sum_abs2': 0.0, 'npts': 0, 'nbl': 0}
+    for g in groups.values():
+        total['sum_abs2'] += g['sum_abs2']
+        total['npts']     += g['npts']
+        total['nbl']      += g['nbl']
+
+    print("\n[Baseline-type noise summary]")
+    hdr = ("Baseline", "n_bl", "Npts_tot", "σ_vis(sim) [Jy]", "σ_im≈σ_vis/√N [Jy]")
+    print(" " + " | ".join(f"{h:>14}" for h in hdr))
+    print("-" * 80)
+
+    # Per-type rows (12m-12m, 12m-18m, 18m-18m, ...)
+    for label in sorted(groups.keys()):
+        g    = groups[label]
+        npts = g['npts']
+        nbl  = g['nbl']
+        if npts <= 0:
+            continue
+        sigma_vis = math.sqrt(g['sum_abs2'] / npts)
+        sigma_im  = sigma_vis / math.sqrt(npts)
+
+        print(" " + " | ".join([
+            f"{label:>14}",
+            f"{nbl:14d}",
+            f"{npts:14d}",
+            f"{sigma_vis:14.4e}",
+            f"{sigma_im:14.4e}",
+        ]))
+
+    # "All" row
+    if total['npts'] > 0 and len(groups) > 1:
+        sigma_vis = math.sqrt(total['sum_abs2'] / total['npts'])
+        sigma_im  = sigma_vis / math.sqrt(total['npts'])
+        print(" " + " | ".join([
+            f"{'All':>14}",
+            f"{total['nbl']:14d}",
+            f"{total['npts']:14d}",
+            f"{sigma_vis:14.4e}",
+            f"{sigma_im:14.4e}",
+        ]))
+
+
+
+def debug_ms_summary(msname, label: str = ""):
+    """
+    Summarize an MS: fields, spw/channels/bandwidth, pol products,
+    antenna diameters, integration time, and weights.
+    """
+    print(f"\n====[ MS SUMMARY {label} ]==== {msname}")
+
+    # --- FIELD info ---
+    tb.open(f"{msname}/FIELD")
+    try:
+        nfields = tb.nrows()
+        cols = set(tb.colnames())
+        if "NAME" in cols:
+            names = tb.getcol("NAME").tolist()
+        else:
+            names = []
+        extra = " …" if len(names) > 6 else ""
+        print(f" fields: {nfields}  names: {names[:6]}{extra}")
+    finally:
+        tb.close()
+
+    # --- SPW info: channels + bandwidth ---
+    tb.open(f"{msname}/SPECTRAL_WINDOW")
+    try:
+        nspw = tb.nrows()
+        cols = set(tb.colnames())
+
+        num_chan = tb.getcol("NUM_CHAN") if "NUM_CHAN" in cols else []
+        nchan0 = int(num_chan[0]) if len(num_chan) else "NA"
+
+        if "TOTAL_BANDWIDTH" in cols:
+            bw = tb.getcol("TOTAL_BANDWIDTH").astype(float)
+        elif "CHAN_WIDTH" in cols:
+            cw = tb.getcol("CHAN_WIDTH")
+            # CHAN_WIDTH usually (nchan, nspw)
+            cw = np.asarray(cw, dtype=float)
+            if cw.ndim == 2:
+                bw = np.abs(cw).sum(axis=0)
+            else:
+                bw = np.array([np.abs(cw).sum()], dtype=float)
+        else:
+            bw = np.array([], dtype=float)
+
+        bw0 = float(bw[0]) if bw.size else float("nan")
+        print(f" spws: {nspw}  nchan(spw0): {nchan0}  bw_Hz(spw0): {bw0:.6g}")
+    finally:
+        tb.close()
+
+    # --- POLARIZATION info ---
+    tb.open(f"{msname}/POLARIZATION")
+    try:
+        npol = int(tb.getcol("NUM_CORR")[0])
+        corr_types = tb.getcell("CORR_TYPE", 0).tolist()
+        corr_names = _corr_type_names(corr_types)
+        print(f" correlations: npol={npol}  types={corr_names}")
+    finally:
+        tb.close()
+
+    # --- ANTENNA diameters (via helper) ---
+    diams, _names = _read_antenna_table(msname)
+    h = Counter(np.round(diams.astype(float), 3))
+    print(f" antennas: {len(diams)}  diameters(m) histogram: {dict(h)}")
+
+    # --- MAIN table: nvis, integration time, weights ---
+    tb.open(msname)
+    try:
+        cols = set(tb.colnames())
+
+        if "TIME_CENTROID" in cols:
+            times = tb.getcol("TIME_CENTROID")
+            times = np.asarray(times, dtype=float)
+            if times.size > 1:
+                tau = float(np.median(np.diff(np.unique(times))))
+            else:
+                tau = float("nan")
+        else:
+            tau = float("nan")
+        print(f" rows(nvis): {tb.nrows()}  integration τ≈{tau:.6g}s")
+
+        if "WEIGHT" in cols:
+            sW = float(tb.getcol("WEIGHT").sum())
+            print(f" sum(WEIGHT): {sW:.6g}")
+        else:
+            print(" WEIGHT column: MISSING")
+
+        if "WEIGHT_SPECTRUM" in cols:
+            sWS = float(tb.getcol("WEIGHT_SPECTRUM").sum())
+            print(f" sum(WEIGHT_SPECTRUM): {sWS:.6g}")
+        else:
+            print(" WEIGHT_SPECTRUM: (absent)")
+    finally:
+        tb.close()
+
+    print("====[ end MS SUMMARY ]====\n")
+
 
